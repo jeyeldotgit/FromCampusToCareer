@@ -403,7 +403,7 @@ def test_loader_raises_runtime_error_when_csv_missing(db_session, tmp_path: Path
 
     missing_path = tmp_path / "unified_job_postings.csv"
     with pytest.raises(RuntimeError, match="historical_bootstrap"):
-        load_historical_batch(db_session, csv_path=missing_path)
+        load_historical_batch(db_session, csv_paths=[missing_path])
 
 
 def test_loader_inserts_rows(db_session, tmp_path: Path) -> None:
@@ -412,7 +412,7 @@ def test_loader_inserts_rows(db_session, tmp_path: Path) -> None:
     csv_path = tmp_path / "unified_job_postings.csv"
     _write_test_csv(csv_path, rows=3)
 
-    result = load_historical_batch(db_session, csv_path=csv_path)
+    result = load_historical_batch(db_session, csv_paths=[csv_path])
     assert result["inserted"] == 3
     assert result["quarantined"] == 0
 
@@ -424,11 +424,11 @@ def test_loader_idempotent(db_session, tmp_path: Path) -> None:
     csv_path = tmp_path / "unified_job_postings.csv"
     _write_test_csv(csv_path, rows=3)
 
-    r1 = load_historical_batch(db_session, csv_path=csv_path)
+    r1 = load_historical_batch(db_session, csv_paths=[csv_path])
     assert r1["inserted"] == 3
 
     count_before = db_session.query(JobPostingUnified).count()
-    r2 = load_historical_batch(db_session, csv_path=csv_path)
+    r2 = load_historical_batch(db_session, csv_paths=[csv_path])
     count_after = db_session.query(JobPostingUnified).count()
 
     # on_conflict_do_update always returns rowcount=1 (insert or update);
@@ -442,8 +442,48 @@ def test_loader_quarantines_invalid_rows(db_session, tmp_path: Path) -> None:
     csv_path = tmp_path / "unified_job_postings.csv"
     _write_test_csv_with_bad_rows(csv_path)
 
-    result = load_historical_batch(db_session, csv_path=csv_path)
+    result = load_historical_batch(db_session, csv_paths=[csv_path])
     assert result["quarantined"] >= 1
+
+
+def test_loader_merges_two_csv_files(db_session, tmp_path: Path) -> None:
+    """Two non-overlapping CSVs are merged and all rows are inserted."""
+    from modules.ingestion.loader import load_historical_batch
+    from modules.ingestion.models import JobPostingUnified
+
+    csv_a = tmp_path / "unified_job_postings.csv"
+    csv_b = tmp_path / "live_scraped_ph.csv"
+    _write_test_csv(csv_a, rows=3)
+    _write_test_csv_with_source(csv_b, rows=2, source="live_ph", country="PH")
+
+    result = load_historical_batch(db_session, csv_paths=[csv_a, csv_b])
+
+    assert result["inserted"] == 5
+    assert result["quarantined"] == 0
+    assert db_session.query(JobPostingUnified).count() == 5
+
+
+def test_loader_dedup_across_files(db_session, tmp_path: Path) -> None:
+    """A posting_id shared across two files produces exactly one DB row.
+
+    CSV A: rows 0, 1, 2  (posting_ids p0, p1, p2)
+    CSV B: row 0 repeated (same posting_id p0) + one new row
+    Expected DB rows: 4  (p0 from CSV A wins, no duplicate)
+    """
+    from modules.ingestion.loader import load_historical_batch
+    from modules.ingestion.models import JobPostingUnified
+
+    shared_pid = make_posting_id("test", "0", "Software Engineer 0", "2024-01")
+
+    csv_a = tmp_path / "unified_job_postings.csv"
+    _write_test_csv(csv_a, rows=3)
+
+    csv_b = tmp_path / "live_scraped_ph.csv"
+    _write_test_csv_with_overlap(csv_b, shared_pid=shared_pid)
+
+    load_historical_batch(db_session, csv_paths=[csv_a, csv_b])
+
+    assert db_session.query(JobPostingUnified).count() == 4
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +691,79 @@ def _write_test_csv_with_bad_rows(path: Path) -> None:
             "country": "global",
             "posted_date": "2024-01",
             "source_dataset": "test",
+        })
+
+
+def _write_test_csv_with_source(
+    path: Path,
+    rows: int,
+    source: str,
+    country: str = "global",
+) -> None:
+    """Write a valid canonical CSV with a custom source_dataset and country.
+
+    Row indices start at 100 to avoid posting_id collisions with _write_test_csv.
+    """
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "posting_id", "title", "role_normalized", "skills",
+                "seniority", "platform", "country", "posted_date", "source_dataset",
+            ],
+        )
+        writer.writeheader()
+        for i in range(100, 100 + rows):
+            pid = make_posting_id(source, str(i), f"Data Analyst {i}", "2024-06")
+            writer.writerow({
+                "posting_id": pid,
+                "title": f"Data Analyst {i}",
+                "role_normalized": "Data Analyst",
+                "skills": "SQL,Excel",
+                "seniority": "entry_level",
+                "platform": "jobstreet",
+                "country": country,
+                "posted_date": "2024-06",
+                "source_dataset": source,
+            })
+
+
+def _write_test_csv_with_overlap(path: Path, shared_pid: str) -> None:
+    """Write a CSV containing one row with shared_pid and one unique new row.
+
+    Used to verify that dedup on posting_id keeps the first-file row.
+    """
+    unique_pid = make_posting_id("live_ph", "999", "Network Engineer", "2024-06")
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "posting_id", "title", "role_normalized", "skills",
+                "seniority", "platform", "country", "posted_date", "source_dataset",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "posting_id": shared_pid,
+            "title": "Software Engineer 0",
+            "role_normalized": "Software Engineer",
+            "skills": "Python",
+            "seniority": "entry_level",
+            "platform": "jobstreet",
+            "country": "PH",
+            "posted_date": "2024-01",
+            "source_dataset": "live_ph",
+        })
+        writer.writerow({
+            "posting_id": unique_pid,
+            "title": "Network Engineer",
+            "role_normalized": "Network Engineer",
+            "skills": "",
+            "seniority": "mid",
+            "platform": "jobstreet",
+            "country": "PH",
+            "posted_date": "2024-06",
+            "source_dataset": "live_ph",
         })
 
 

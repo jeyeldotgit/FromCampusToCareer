@@ -17,9 +17,21 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
+    # Comma-separated list of allowed CORS origins.
+    # Use "*" only for local development; always restrict in production.
+    cors_origins: str = "http://localhost:5173,http://localhost:3000, http://localhost:5174"
+
     raw_data_path: str = "data/raw"
     processed_data_path: str = "data/processed"
     spacy_model: str = "en_core_web_sm"
+
+    def get_cors_origins(self) -> list[str]:
+        """Return the parsed list of allowed CORS origins.
+
+        Returns:
+            List of origin strings split from the comma-separated config value.
+        """
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
 
 settings = Settings()

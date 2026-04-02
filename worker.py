@@ -3,7 +3,7 @@
 Reads the oldest pending run from pipeline_runs, then executes:
     1. load_historical_batch  (ingestion)
     2. run_normalization      (skill extraction → posting_skills)
-    3. run_ph_sdi_refresh     (SDI snapshot computation)
+    3. run_sdi_refresh        (SDI snapshot computation)
 
 Usage:
     python worker.py
@@ -13,6 +13,7 @@ after POST /admin/jobs/run creates a pending row.
 """
 
 from __future__ import annotations
+from core.config import settings
 
 import logging
 import sys
@@ -20,6 +21,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+csv_paths = [
+    Path(settings.processed_data_path) / "unified_job_postings.csv",
+    Path(settings.processed_data_path) / "ict_postings_2020_2025.csv",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,8 +64,22 @@ def run_pipeline() -> None:
         logger.info("Pipeline run started", extra={"run_id": str(run.id)})
 
         logger.info("Step 1/3: Loading historical batch...")
-        batch_result = load_historical_batch(db)
-        logger.info("Batch load: %s", batch_result)
+        processed_dir = Path(settings.processed_data_path)
+        csv_paths = sorted(processed_dir.glob("*.csv"))
+
+        if not csv_paths:
+            raise RuntimeError(f"No CSV files found in {processed_dir}")
+
+        logger.info("Found %d CSV file(s): %s", len(csv_paths), [p.name for p in csv_paths])
+
+        total = {"inserted": 0, "skipped": 0, "quarantined": 0}
+        for csv_path in csv_paths:
+            logger.info("Loading %s...", csv_path.name)
+            result = load_historical_batch(db, csv_paths=[csv_path])
+            for k in total:
+                total[k] += result[k]
+
+        logger.info("Batch load: %s", total)
 
         logger.info("Step 2/3: Running normalization (skill extraction)...")
         norm_result = run_normalization(db)

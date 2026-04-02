@@ -12,6 +12,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from core.config import settings
 from modules.auth.router import router as auth_router
 from modules.gap_and_roadmap.router import router as gap_router
 from modules.ingestion.router import router as ingestion_router
@@ -34,6 +36,14 @@ app = FastAPI(
     version="1.0.0",
     description="Career readiness analysis for Filipino university students",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth_router)

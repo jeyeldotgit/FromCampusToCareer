@@ -50,6 +50,21 @@ def get_gap_analysis(
         )
 
     weighted_sdi = get_weighted_sdi(role_id=target.role_id, db=db)
+
+    # #region agent log — H-A post-fix: confirm scope fallback produced results
+    import json as _json, time as _time
+    from pathlib import Path as _Path
+    _LOG_FILE = _Path(__file__).resolve().parents[3] / "debug-feaa13.log"
+    with open(_LOG_FILE, "a") as _lf:
+        _lf.write(_json.dumps({
+            "sessionId": "feaa13", "runId": "post-fix", "hypothesisId": "H-A",
+            "location": "gap_and_roadmap/router.py:get_weighted_sdi_result",
+            "message": "weighted_sdi after scope-fallback fix",
+            "data": {"role_id": str(target.role_id), "result_size": len(weighted_sdi), "is_empty": not weighted_sdi},
+            "timestamp": int(_time.time() * 1000),
+        }) + "\n")
+    # #endregion
+
     if not weighted_sdi:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

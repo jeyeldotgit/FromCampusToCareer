@@ -79,3 +79,24 @@ def extract_skills(
     doc = nlp(text[:50_000])  # guard against very long descriptions
     matches = matcher(doc)
     return {nlp.vocab.strings[match_id] for match_id, _start, _end in matches}
+
+
+def extract_skills_from_doc(
+    doc: spacy.tokens.Doc,
+    matcher: PhraseMatcher,
+) -> set[str]:
+    """Extract canonical skill names from an already-processed spaCy Doc.
+
+    Accepts a pre-built Doc so that callers using nlp.pipe() for batch
+    processing do not pay the cost of an extra nlp() call per document.
+    Functionally equivalent to extract_skills() for the same text input.
+
+    Args:
+        doc: Pre-processed spaCy Doc object.
+        matcher: Compiled PhraseMatcher built against the skill taxonomy.
+
+    Returns:
+        Set of matched canonical skill name strings (deduplicated).
+    """
+    matches = matcher(doc)
+    return {doc.vocab.strings[match_id] for match_id, _start, _end in matches}

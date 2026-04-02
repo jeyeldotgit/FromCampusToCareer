@@ -9,6 +9,10 @@ Recency-weighted SDI (for gap analysis ranking):
 
     SDI_weighted = sum(SDI(t) * decay_factor^(N - t_index)) / sum(decay_factor^(N - t_index))
 
+Write path uses a single SQL INSERT...SELECT (ELT) for performance.
+compute_sdi_snapshots is kept as the Python formula reference for unit testing.
+See docs/plans/PIPELINE-analytics_sdi.md for the cross-reference rule.
+
 Results are upserted (not appended), so reruns produce stable snapshot counts.
 """
 
@@ -16,100 +20,107 @@ from __future__ import annotations
 
 import logging
 import uuid
-from decimal import Decimal
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
-
-from modules.analytics_sdi.models import SdiSnapshot
 
 logger = logging.getLogger(__name__)
 
 ENTRY_LEVEL_SENIORITY = "entry_level"
 DEFAULT_DECAY_FACTOR = 0.90
+VALID_SCOPES: frozenset[str] = frozenset({"ph", "global"})
+
+_SDI_UPSERT_SQL = text("""
+    INSERT INTO sdi_snapshots
+        (id, skill_id, role_id, period, sdi_value, posting_count, scope)
+    SELECT
+        gen_random_uuid(),
+        ps.skill_id,
+        rc.id                                             AS role_id,
+        jp.posted_date                                    AS period,
+        ROUND(
+            COUNT(DISTINCT ps.posting_id)::numeric /
+            NULLIF(totals.total_postings, 0),
+            4
+        )                                                 AS sdi_value,
+        COUNT(DISTINCT ps.posting_id)                     AS posting_count,
+        :scope                                            AS scope
+    FROM job_postings_unified jp
+    JOIN posting_skills ps  ON ps.posting_id    = jp.posting_id
+    JOIN role_catalog   rc  ON rc.name          = jp.role_normalized
+    JOIN (
+        SELECT role_normalized, posted_date,
+               COUNT(DISTINCT posting_id) AS total_postings
+        FROM   job_postings_unified
+        WHERE  seniority = 'entry_level'
+          AND  (:country IS NULL OR country = :country)
+        GROUP  BY role_normalized, posted_date
+    ) totals ON totals.role_normalized = jp.role_normalized
+            AND totals.posted_date     = jp.posted_date
+    WHERE jp.seniority = 'entry_level'
+      AND (:country IS NULL OR jp.country = :country)
+    GROUP BY ps.skill_id, rc.id, jp.posted_date, totals.total_postings
+    ON CONFLICT ON CONSTRAINT uq_sdi_snapshot
+    DO UPDATE SET
+        sdi_value     = EXCLUDED.sdi_value,
+        posting_count = EXCLUDED.posting_count,
+        computed_at   = now()
+""")
+
+_UNMATCHED_ROLES_SQL = text("""
+    SELECT jp.role_normalized, COUNT(DISTINCT jp.posting_id) AS posting_count
+    FROM   job_postings_unified jp
+    WHERE  jp.seniority = 'entry_level'
+      AND  (:country IS NULL OR jp.country = :country)
+      AND  NOT EXISTS (
+               SELECT 1 FROM role_catalog rc WHERE rc.name = jp.role_normalized
+           )
+    GROUP  BY jp.role_normalized
+    ORDER  BY posting_count DESC
+""")
 
 
-def _load_posting_skill_df(db: Session, country_filter: str | None = None) -> pd.DataFrame:
-    """Load entry-level posting/skill/role/period data into a DataFrame.
+def _log_unmatched_roles(
+    db: Session,
+    country_filter: str | None,
+    scope: str,
+) -> None:
+    """Log role_normalized values in job_postings_unified with no role_catalog match.
+
+    Runs as a read-only diagnostic after the upsert commits. Does not affect
+    pipeline execution. Admin should review WARNING entries to expand role mappings.
 
     Args:
         db: Active database session.
-        country_filter: If provided, restrict to postings with this country value
-            (e.g. 'PH'). If None, all countries are included (global scope).
-
-    Returns:
-        DataFrame with columns: posting_id, role_normalized, posted_date, skill_id.
+        country_filter: Same country filter used by the preceding upsert.
+        scope: Scope label for context in log messages.
     """
-    if country_filter:
-        sql = text("""
-            SELECT
-                jp.posting_id,
-                jp.role_normalized,
-                jp.posted_date,
-                ps.skill_id::text AS skill_id
-            FROM job_postings_unified jp
-            JOIN posting_skills ps ON ps.posting_id = jp.posting_id
-            WHERE jp.country = :country
-              AND jp.seniority = :seniority
-        """)
-        rows = db.execute(sql, {"country": country_filter, "seniority": ENTRY_LEVEL_SENIORITY}).fetchall()
-    else:
-        sql = text("""
-            SELECT
-                jp.posting_id,
-                jp.role_normalized,
-                jp.posted_date,
-                ps.skill_id::text AS skill_id
-            FROM job_postings_unified jp
-            JOIN posting_skills ps ON ps.posting_id = jp.posting_id
-            WHERE jp.seniority = :seniority
-        """)
-        rows = db.execute(sql, {"seniority": ENTRY_LEVEL_SENIORITY}).fetchall()
-
-    return pd.DataFrame(rows, columns=["posting_id", "role_normalized", "posted_date", "skill_id"])
+    rows = db.execute(_UNMATCHED_ROLES_SQL, {"country": country_filter}).fetchall()
+    for role_name, count in rows:
+        logger.warning(
+            "Unmatched role_normalized excluded from SDI snapshots",
+            extra={"scope": scope, "role_normalized": role_name, "posting_count": count},
+        )
 
 
-def _load_role_id_map(db: Session) -> dict[str, uuid.UUID]:
-    """Return a role_name -> role_id mapping from the database.
+def compute_sdi_snapshots(df: pd.DataFrame) -> pd.DataFrame:
+    """Formula reference implementation of the per-period SDI computation.
 
-    Args:
-        db: Active database session.
+    This function is the authoritative Python specification of the SDI formula.
+    It is NOT called by the production write path (run_sdi_refresh uses SQL).
+    It exists solely for unit testing and formula auditability.
 
-    Returns:
-        Dictionary mapping role name strings to UUIDs.
-    """
-    rows = db.execute(text("SELECT id, name FROM role_catalog")).fetchall()
-    return {row[1]: uuid.UUID(str(row[0])) for row in rows}
-
-
-def _load_skill_id_map(db: Session) -> dict[str, uuid.UUID]:
-    """Return a skill_name -> skill_id mapping from the database.
-
-    Args:
-        db: Active database session.
-
-    Returns:
-        Dictionary mapping skill name strings to UUIDs.
-    """
-    rows = db.execute(text("SELECT id, name FROM skills")).fetchall()
-    return {row[1]: uuid.UUID(str(row[0])) for row in rows}
-
-
-def compute_sdi_snapshots(
-    df: pd.DataFrame,
-    decay_factor: float = DEFAULT_DECAY_FACTOR,
-) -> pd.DataFrame:
-    """Compute per-period SDI values for every (skill, role, period) triple.
+    IMPORTANT: If you change the formula here you must also update the SQL in
+    run_sdi_refresh, and vice versa.
+    See docs/plans/PIPELINE-analytics_sdi.md for the cross-reference rule.
 
     Args:
         df: DataFrame with columns posting_id, role_normalized, posted_date, skill_id.
-        decay_factor: Exponential recency weight (default 0.90).
 
     Returns:
-        DataFrame with columns: role_normalized, posted_date, skill_id, sdi_value, posting_count.
+        DataFrame with columns: role_normalized, posted_date, skill_id, sdi_value,
+        posting_count.
     """
     if df.empty:
         return pd.DataFrame(
@@ -142,90 +153,51 @@ def run_sdi_refresh(
     db: Session,
     scope: str,
     country_filter: str | None = None,
-    decay_factor: float = DEFAULT_DECAY_FACTOR,
 ) -> int:
     """Compute and upsert SDI snapshots for all skill/role/period triples.
 
-    Uses ON CONFLICT DO UPDATE so rows are upserted, not appended, making this
-    safe to rerun without corrupting counts.
+    Uses a single SQL INSERT...SELECT...ON CONFLICT DO UPDATE (ELT pattern).
+    This replaces the previous N+1 Python upsert loop, cutting wall time from
+    minutes to seconds on large datasets.
+
+    Idempotent: rerunning upserts existing rows rather than appending duplicates.
+    computed_at is explicitly refreshed in the DO UPDATE SET clause because
+    SQLAlchemy ORM onupdate hooks do not fire for raw SQL execution.
 
     Args:
         db: Active database session.
-        scope: Snapshot scope label stored in sdi_snapshots ('ph' or 'global').
+        scope: Snapshot scope label ('ph' or 'global'). Raises ValueError on
+            unknown values.
         country_filter: If provided, restrict source postings to this country
-            (e.g. 'PH'). If None, all countries are included.
-        decay_factor: Recency decay weight passed to snapshot computation.
+            (e.g. 'PH'). Pass None to include all countries.
 
     Returns:
-        Number of snapshots upserted.
-    """
-    role_map = _load_role_id_map(db)
-    skill_id_to_uuid: dict[str, uuid.UUID] = {}
-    rows = db.execute(text("SELECT id FROM skills")).fetchall()
-    for row in rows:
-        skill_id_to_uuid[str(row[0])] = uuid.UUID(str(row[0]))
+        Number of snapshots inserted or updated.
 
-    df = _load_posting_skill_df(db, country_filter=country_filter)
-    if df.empty:
+    Raises:
+        ValueError: If scope is not a recognised value in VALID_SCOPES.
+    """
+    if scope not in VALID_SCOPES:
+        raise ValueError(
+            f"Unknown scope {scope!r}. Valid values: {sorted(VALID_SCOPES)}"
+        )
+
+    result = db.execute(_SDI_UPSERT_SQL, {"scope": scope, "country": country_filter})
+    db.commit()
+    upserted = result.rowcount
+
+    if upserted == 0:
         logger.warning(
-            "No entry-level posting-skill data found for scope=%s country_filter=%s; SDI skipped",
+            "No snapshots written for scope=%s country_filter=%s — "
+            "check posting_skills and role_catalog coverage",
             scope,
             country_filter,
         )
         return 0
 
-    snapshot_df = compute_sdi_snapshots(df, decay_factor)
-    upserted = 0
-
-    for _, snap_row in snapshot_df.iterrows():
-        role_id = role_map.get(snap_row["role_normalized"])
-        if not role_id:
-            continue
-
-        skill_uuid_str = str(snap_row["skill_id"])
-        skill_uuid = skill_id_to_uuid.get(skill_uuid_str)
-        if not skill_uuid:
-            continue
-
-        sdi_val = Decimal(str(round(float(snap_row["sdi_value"]), 4)))
-        stmt = (
-            insert(SdiSnapshot)
-            .values(
-                id=uuid.uuid4(),
-                skill_id=skill_uuid,
-                role_id=role_id,
-                period=str(snap_row["posted_date"]),
-                sdi_value=sdi_val,
-                posting_count=int(snap_row["posting_count"]),
-                scope=scope,
-            )
-            .on_conflict_do_update(
-                constraint="uq_sdi_snapshot",
-                set_={
-                    "sdi_value": sdi_val,
-                    "posting_count": int(snap_row["posting_count"]),
-                },
-            )
-        )
-        db.execute(stmt)
-        upserted += 1
-
-    db.commit()
+    _log_unmatched_roles(db, country_filter, scope)
     logger.info("SDI refresh complete", extra={"scope": scope, "upserted": upserted})
     return upserted
-
-
-def run_ph_sdi_refresh(db: Session, decay_factor: float = DEFAULT_DECAY_FACTOR) -> int:
-    """Backward-compatible shim — calls run_sdi_refresh with scope='ph'.
-
-    Args:
-        db: Active database session.
-        decay_factor: Recency decay weight.
-
-    Returns:
-        Number of PH snapshots upserted.
-    """
-    return run_sdi_refresh(db, scope="ph", country_filter="PH", decay_factor=decay_factor)
 
 
 def get_weighted_sdi(
@@ -239,24 +211,39 @@ def get_weighted_sdi(
     Implements the weighted formula from the intelligence documentation:
         SDI_weighted = sum(SDI(t) * decay^(N-t_index)) / sum(decay^(N-t_index))
 
+    If the requested scope has no data (e.g. 'ph' but no PH postings have been
+    ingested yet), automatically falls back to 'global' so the gap endpoint
+    remains functional with the broader dataset.
+
     Args:
         role_id: UUID of the target role.
         db: Active database session.
-        scope: 'ph' for student-facing gap analysis.
+        scope: Preferred scope ('ph' or 'global'). Falls back to 'global' when
+            the preferred scope has no snapshots for this role.
         decay_factor: Exponential recency weight.
 
     Returns:
         Dictionary mapping skill_id UUID to weighted SDI float value.
     """
-    rows = db.execute(
-        text("""
-            SELECT skill_id, period, sdi_value
-            FROM sdi_snapshots
-            WHERE role_id = :role_id AND scope = :scope
-            ORDER BY period ASC
-        """),
-        {"role_id": str(role_id), "scope": scope},
-    ).fetchall()
+    scopes_to_try = [scope, "global"] if scope != "global" else ["global"]
+
+    rows: list = []
+    for try_scope in scopes_to_try:
+        rows = db.execute(
+            text("""
+                SELECT skill_id, period, sdi_value
+                FROM sdi_snapshots
+                WHERE role_id = :role_id AND scope = :scope
+                ORDER BY period ASC
+            """),
+            {"role_id": str(role_id), "scope": try_scope},
+        ).fetchall()
+        if rows:
+            logger.debug(
+                "get_weighted_sdi: using scope=%s (requested=%s) for role_id=%s",
+                try_scope, scope, role_id,
+            )
+            break
 
     if not rows:
         return {}
