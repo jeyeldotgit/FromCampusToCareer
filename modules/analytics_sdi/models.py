@@ -13,8 +13,9 @@ from core.database import Base
 class SdiSnapshot(Base):
     """Single SDI value for a skill/role/period/scope combination.
 
-    scope='ph'     — Philippine postings (student-facing gap analysis)
-    scope='global' — All-country postings (Stage 3: decay trend depth)
+    scope='ph'     — Philippine postings (preferred for student gap analysis)
+    scope='global' — All-country postings (gap analysis fallback when PH empty;
+                    Stage 2 analytics_decay time series)
 
     UNIQUE constraint on (skill_id, role_id, period, scope) ensures that
     recomputation upserts existing rows rather than appending new ones.

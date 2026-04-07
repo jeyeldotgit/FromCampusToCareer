@@ -129,18 +129,19 @@ The pipeline runs in two scopes:
 
 | scope | country_filter | Purpose |
 |---|---|---|
-| `ph` | `PH` | Philippine-only snapshots for student-facing gap analysis |
-| `global` | `None` | All-country snapshots for Stage 2 decay trend analysis |
+| `ph` | `PH` | Philippine-only snapshots — **preferred** for student-facing gap analysis |
+| `global` | `None` | All-country snapshots — **fallback** for gap analysis when PH has no rows for a role; **Stage 2 `analytics_decay`** time series |
 
-`worker.py` triggers both scopes in sequence:
+`worker.py` triggers both scopes in sequence (order matches code):
 
 ```python
-run_sdi_refresh(db, scope="ph", country_filter="PH")
 run_sdi_refresh(db, scope="global", country_filter=None)
+run_sdi_refresh(db, scope="ph", country_filter="PH")
 ```
 
-`get_weighted_sdi` defaults to `scope='ph'` and automatically falls back to
-`'global'` when the PH scope has no snapshots for a given role.
+### Student read path (gap analysis)
+
+`GET /student/gap-analysis` uses `get_weighted_sdi(..., scope="ph")`. If there are **no** `sdi_snapshots` rows for that `role_id` with `scope='ph'`, the same function **retries with `scope='global'`** so the endpoint stays useful when the database is dominated by non-PH or not-yet-PH-filtered postings. Log level **DEBUG** records which scope was used. The HTTP response does not yet expose `effective_scope`; treat logs or future API fields if product needs to label “PH market” vs “all markets.”
 
 ---
 

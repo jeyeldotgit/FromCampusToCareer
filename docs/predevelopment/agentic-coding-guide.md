@@ -116,7 +116,7 @@ Check:
 - folder structure scalability
 - hidden technical debt
 
-Produce REVIEW-SIGNOFF-ingestion-2026-03-28.
+Produce `REVIEW-SIGNOFF-<module>-<YYYY-MM-DD>.md`.
 State: approved / approved with conditions / rejected.
 List any required changes before the engineer starts.
 ```
@@ -129,7 +129,7 @@ List any required changes before the engineer starts.
 ACTIVE ROLE: backend-reviewer
 MODULE: ingestion
 ARCH-PLAN: @backend/docs/plans/ARCH-PLAN-ingestion-2026-03-28.md
-SIGN-OFF: @backend/docs/plans/REVIEW-SIGNOFF-ingestion-2026-03-28.md
+SIGN-OFF: @backend/docs/plans/REVIEW-SIGNOFF-<module>-<date>.md
 
 Review the implemented ingestion module code.
 Check for drift from the approved plan, missing test coverage, and any tech debt introduced.
@@ -178,7 +178,7 @@ EXIT CONDITION: all acceptance criteria pass; no other module is touched.
 ACTIVE ROLE: backend-engineer
 MODULE: ingestion
 APPROVED PLAN: @backend/docs/plans/ARCH-PLAN-ingestion-2026-03-28.md
-SIGN-OFF: @backend/docs/plans/REVIEW-SIGNOFF-ingestion-2026-03-28.md (approved)
+SIGN-OFF: @backend/docs/plans/REVIEW-SIGNOFF-<module>-<date>.md (approved)
 ACCEPTANCE CRITERIA:
   - historical_bootstrap job produces valid 9-column canonical CSV
   - deterministic posting_id is idempotent across reruns
@@ -204,7 +204,7 @@ Do not redesign any boundaries. Stop when exit criteria are confirmed.
 | Artifact          | Filename pattern                          | Save location         |
 | ----------------- | ----------------------------------------- | --------------------- |
 | Architecture plan | `ARCH-PLAN-<module>-<YYYY-MM-DD>.md`      | `backend/docs/plans/` |
-| Review sign-off   | `REVIEW-SIGNOFF-<module>-<YYYY-MM-DD>.md` | `backend/docs/plans/` |
+| Review sign-off   | `REVIEW-SIGNOFF-<module>-<YYYY-MM-DD>.md` | `backend/docs/plans/` (active); superseded → `backend/docs/archive/` |
 
 
 **Module name values** (from `architecture.md`):

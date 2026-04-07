@@ -53,7 +53,7 @@ This is the minimum loop that makes the system demonstrable, testable by real st
 - **`taxonomy_admin`** — canonical skills, alias map, course-to-skill mappings, grade-to-depth rules. Analytics cannot run without a seeded taxonomy. Admin-only API endpoints (no UI needed yet).
 - **`ingestion`** — historical dataset import only (no live scraping). Load the initial unified PH job postings dataset once. Raw payload persistence included for reprocessability.
 - **`normalization`** — canonical schema mapping, deterministic `posting_id` generation, seniority/role standardization, skill extraction (spaCy PhraseMatcher), skill normalization (alias lookup), and `posting_skills` association output. Must run before any analytics.
-- **`analytics_sdi`** — SDI snapshot computation (PH scope only). This is the backbone that all gap analysis depends on. Global scope deferred to Stage 3.
+- **`analytics_sdi`** — SDI snapshot computation for **`ph` and `global`** in one worker run (`run_sdi_refresh` twice: all countries, then `country=PH`). **Student-facing gap analysis** calls `get_weighted_sdi(..., scope="ph")` first; if a role has no PH snapshots yet, it **falls back to `global`** so rankings still work on mixed or non-PH datasets. See `backend/docs/plans/PIPELINE-analytics_sdi.md`.
 - **`gap_and_roadmap`** — gap identification (missing + depth gaps), SDI-priority ranking, readiness score computation and history. Roadmap output in MVP is a ranked skill list with priority band; full certification/project recommendations are Stage 2.
 
 ### What is intentionally excluded from Stage 1
@@ -93,9 +93,9 @@ flowchart TD
     taxonomy --> normalization
     normalization --> postings[(job_postings_unified)]
     normalization --> posting_skills[(posting_skills)]
-    postings --> sdi[SDI computation]
+    postings --> sdi[SDI computation ph + global]
     posting_skills --> sdi
-    sdi --> sdi_snapshots[(sdi_snapshots scope=ph)]
+    sdi --> sdi_snapshots[(sdi_snapshots scope ph or global)]
     student_input[Student enters profile + target role] --> profile[(student_profiles)]
     profile --> gap[Gap analysis engine]
     taxonomy --> gap
@@ -106,7 +106,7 @@ flowchart TD
 
 The `posting_skills` join table is a required output of normalization. It links each canonical posting to its extracted skill IDs and is the input the SDI pipeline counts against. Without it, SDI computation has no skill frequency data.
 
-**Gap analysis design constraint:** Gap analysis runs synchronously within the API request on profile update. It reads precomputed `sdi_snapshots` and performs set-difference logic in memory against the student's skill inventory. This is fast because all heavy computation (normalization, SDI) is precomputed by the worker. The engineer must not move gap analysis to a background job — that would break the real-time student experience.
+**Gap analysis design constraint:** Gap analysis runs **synchronously** when the student calls `GET /student/gap-analysis`. It reads precomputed `sdi_snapshots` (via `get_weighted_sdi`, PH-first with global fallback) and performs set-difference logic in memory against the student's skill inventory. Heavy work stays in the worker; do not move gap computation to a background job for the MVP student loop.
 
 ---
 
@@ -142,7 +142,7 @@ Raw storage:
 
 **Schema design notes:**
 
-- `sdi_snapshots` uses a single table with a `scope` column (`ph` / `global`) instead of separate `sdi_snapshots_ph` / `sdi_snapshots_global` tables. Stage 3 simply adds rows with `scope='global'` — no migration needed.
+- `sdi_snapshots` uses a single table with a `scope` column (`ph` / `global`). Stage 1 already writes both scopes each pipeline run; Stage 2 **decay** reads the same table (typically **`global`** time series). No separate `sdi_snapshots_ph` / `sdi_snapshots_global` tables.
 - `readiness_history` includes a `period` column (`YYYY-MM`) from the start to support semester-by-semester querying without retrofitting.
 
 ---
@@ -262,7 +262,7 @@ Adds the remaining intelligence layers and replaces manual admin operations with
 ### Modules added or upgraded
 
 - **`career_affinity`** — K-Means clustering over subject-domain feature vectors; affinity signal to role family mapping; silhouette score validation required before surfacing results
-- **`analytics_sdi`** — global scope added: new ingestion pipeline for global dataset; normalization pipeline produces rows with `scope='global'` into existing `sdi_snapshots` table — no schema migration needed
+- **`analytics_sdi`** — optional **expansion** of datasets feeding `global` / `ph` (e.g. dedicated global market feeds, higher-volume PH scrapes). Schema unchanged; same `run_sdi_refresh` contract.
 - **Admin panel UI** — replaces direct API use for taxonomy management and pipeline control
 - **`gap_and_roadmap`** — affinity-aligned suggestions added to `roadmap_service.py`
 - **`reporting_observability`** — full data quality reporting, pipeline SLA tracking
@@ -275,12 +275,12 @@ Adds the remaining intelligence layers and replaces manual admin operations with
 ### Stage 3 risks
 
 - K-Means cold-start: run internal silhouette score validation before surfacing affinity results to students.
-- Global SDI pipeline: treat as a completely separate ingestion path with its own quality checks. Do not mix PH and global raw sources in the same ingestion job.
+- Global vs PH data quality: keep **canonical posting rows** in `job_postings_unified` with correct `country` and provenance; run separate bootstrap/transform jobs per source family if needed so SDI filters stay trustworthy.
 
 ---
 
 ## Stage Summary
 
-- **Stage 1 MVP:** auth, student_profile, taxonomy_admin, ingestion (batch), normalization + posting_skills, analytics_sdi (ph scope), gap_and_roadmap (gap_service + roadmap_service separated). Deliverables: working student gap loop + seed_taxonomy.py.
+- **Stage 1 MVP:** auth, student_profile, taxonomy_admin, ingestion (batch), normalization + posting_skills, analytics_sdi (**`ph` + `global` snapshots**; student read path **PH → global fallback**), gap_and_roadmap (gap_service + roadmap_service separated). Deliverables: working student gap loop + `seed_taxonomy.py`.
 - **Stage 2 Intelligence:** analytics_decay, live ingestion + scheduler, SBERT intent parsing, notifications, observability, roadmap enhancements.
-- **Stage 3 Full:** career_affinity, global SDI scope, admin panel UI, full observability.
+- **Stage 3 Full:** career_affinity, admin panel UI, full observability, optional expanded global/PH data products.

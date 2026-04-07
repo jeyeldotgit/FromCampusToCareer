@@ -192,7 +192,7 @@ Transactional tables:
 
 - users, student_profiles, course_records, certifications, projects
 - skills, skill_aliases, role_catalog, course_skill_map, grade_depth_rules
-- job_postings_unified, job_postings_ph, sdi_snapshots_ph, sdi_snapshots_global
+- job_postings_unified, posting_skills, sdi_snapshots (with `scope` = `ph` | `global`)
 - decay_alerts, gap_results, roadmap_items, readiness_history
 - pipeline_runs, pipeline_run_logs, data_quality_reports
 
